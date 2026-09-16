@@ -36,12 +36,22 @@ export interface PriceLevelSummary {
   orderCount: number;
 }
 
+export interface StockQuoteSummary {
+  symbol: string;
+  price: number;
+  previousClose: number;
+  change: number;
+  changePercent: number;
+  lastUpdated: number;
+}
+
 export interface BookSnapshot {
   sequence: number;
   timestamp: number;
   bids: PriceLevelSummary[];
   asks: PriceLevelSummary[];
   referencePrice: number;
+  stockQuote?: StockQuoteSummary;
 }
 
 export interface OrderRequest {
@@ -75,6 +85,7 @@ export interface MicrostructureMetrics {
   bestAsk: number | null;
   bestAskQty: number | null;
   timestamp: number;
+  stockQuote?: StockQuoteSummary;
 }
 
 export type EngineEventType =

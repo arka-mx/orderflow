@@ -31,11 +31,14 @@ interface BookState {
   connected: boolean;
   isSubmitting: boolean;
   lastErrorMessage: string | null;
+  stockQuote: import('../engine/types').StockQuoteSummary | null;
+  activeSymbol: string;
 
   connect: () => void;
   disconnect: () => void;
   submitOrder: (order: OrderRequest) => Promise<{ success: boolean; message?: string }>;
   clearError: () => void;
+  switchSymbol: (symbol: string) => Promise<void>;
 }
 
 let eventSource: EventSource | null = null;
@@ -51,8 +54,23 @@ export const useBookStore = create<BookState>((set, get) => ({
   connected: false,
   isSubmitting: false,
   lastErrorMessage: null,
+  stockQuote: null,
+  activeSymbol: 'NVDA',
 
   clearError: () => set({ lastErrorMessage: null }),
+
+  switchSymbol: async (symbol: string) => {
+    try {
+      set({ activeSymbol: symbol.toUpperCase() });
+      await fetch('/api/stock', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ symbol }),
+      });
+    } catch (err) {
+      console.error('Failed to switch stock symbol', err);
+    }
+  },
 
   connect: () => {
     if (typeof window === 'undefined') return;
@@ -75,6 +93,8 @@ export const useBookStore = create<BookState>((set, get) => ({
             asks: snapshot.asks,
             referencePrice: snapshot.referencePrice,
             sequence: snapshot.sequence,
+            stockQuote: snapshot.stockQuote || get().stockQuote,
+            activeSymbol: snapshot.stockQuote?.symbol || get().activeSymbol,
           });
         } catch (err) {
           console.error('Error parsing snapshot event', err);
@@ -84,7 +104,10 @@ export const useBookStore = create<BookState>((set, get) => ({
       eventSource.addEventListener('metrics', (e: MessageEvent) => {
         try {
           const metrics: MicrostructureMetrics = JSON.parse(e.data);
-          set({ metrics });
+          set({
+            metrics,
+            stockQuote: metrics.stockQuote || get().stockQuote,
+          });
         } catch (err) {
           console.error('Error parsing metrics event', err);
         }

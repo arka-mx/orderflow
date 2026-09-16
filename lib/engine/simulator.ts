@@ -7,9 +7,11 @@ import {
   OrderRequest,
   OrderResult,
   Trade,
+  StockQuoteSummary,
 } from './types';
 import { calculateSpreadMetrics } from '../metrics/spread';
 import { calculateOBI, OFICalculator } from '../metrics/imbalance';
+import { getGlobalYahooService, YahooQuote } from './yfinance';
 
 export interface SimulatorConfig {
   initialPrice?: number;
@@ -38,25 +40,65 @@ export class MarketSimulator implements FeedAdapter {
   private listeners: Set<FeedAdapterListener> = new Set();
   private timer: NodeJS.Timeout | null = null;
   private isRunning: boolean = false;
+  private unsubscribeYf: (() => void) | null = null;
 
   constructor(config: SimulatorConfig = {}) {
     this.tickSize = config.tickSize ?? 0.01;
     this.referencePrice = config.initialPrice ?? 100.0;
     this.initialTargetPrice = this.referencePrice;
     this.arrivalLambda = config.arrivalLambda ?? 8; // ~8 events per second
-    this.volatility = config.volatility ?? 0.15;
-    this.meanReversionSpeed = config.meanReversionSpeed ?? 0.05;
+    this.volatility = config.volatility ?? 0.08;
+    this.meanReversionSpeed = config.meanReversionSpeed ?? 0.1;
     this.topNLevels = config.topNLevels ?? 5;
 
     this.book = new OrderBook(2);
     this.engine = new MatchingEngine(this.book);
     this.ofiCalc = new OFICalculator(config.ofiWindow ?? 50);
 
+    // Wire real Yahoo Finance feed
+    const yf = getGlobalYahooService();
+    const initQuote = yf.getQuote();
+    if (initQuote && initQuote.regularMarketPrice > 0) {
+      this.referencePrice = initQuote.regularMarketPrice;
+      this.initialTargetPrice = this.referencePrice;
+    }
+
     this.seedInitialBook();
+
+    // Subscribe to Yahoo Finance 10-second updates
+    this.unsubscribeYf = yf.subscribe((quote) => {
+      this.handleYahooQuote(quote);
+    });
   }
 
   private roundPrice(p: number): number {
     return Math.round(p * 100) / 100;
+  }
+
+  /**
+   * Called when Yahoo Finance pushes a live quote update every 10 seconds.
+   */
+  public handleYahooQuote(quote: YahooQuote): void {
+    if (!quote || quote.regularMarketPrice <= 0) return;
+
+    const oldPrice = this.referencePrice;
+    const newPrice = quote.regularMarketPrice;
+    this.referencePrice = newPrice;
+    this.initialTargetPrice = newPrice;
+
+    // Reseed book if price moved or to refresh liquidity distribution around real stock price
+    if (Math.abs(newPrice - oldPrice) >= 0.02 || this.book.getSortedBids().length === 0) {
+      this.seedInitialBook();
+    }
+
+    this.sequence++;
+    const snapshot = this.getSnapshot();
+    const metrics = this.getMetrics();
+
+    for (const listener of this.listeners) {
+      if (listener.onSnapshot) listener.onSnapshot(snapshot);
+      if (listener.onMetrics) listener.onMetrics(metrics);
+    }
   }
 
   /**
@@ -68,7 +110,7 @@ export class MarketSimulator implements FeedAdapter {
     const baseBid = this.roundPrice(this.referencePrice - halfSpread);
     const baseAsk = this.roundPrice(this.referencePrice + halfSpread);
 
-    // Seed 10 bid levels
+    // Seed 12 bid levels
     for (let i = 0; i < 12; i++) {
       const p = this.roundPrice(baseBid - i * 0.02);
       const qty = Math.floor(20 + Math.random() * 80) * 10;
@@ -84,7 +126,7 @@ export class MarketSimulator implements FeedAdapter {
       });
     }
 
-    // Seed 10 ask levels
+    // Seed 12 ask levels
     for (let i = 0; i < 12; i++) {
       const p = this.roundPrice(baseAsk + i * 0.02);
       const qty = Math.floor(20 + Math.random() * 80) * 10;
@@ -114,10 +156,9 @@ export class MarketSimulator implements FeedAdapter {
   }
 
   /**
-   * Simulates random walk on the reference latent price with slight mean-reversion.
+   * Simulates microscopic noise on the reference price, mean-reverting to the real Yahoo Finance quote.
    */
   private stepReferencePrice(dt: number): void {
-    // Normal random variate via Box-Muller transform
     const u1 = Math.max(1e-7, Math.random());
     const u2 = Math.random();
     const z = Math.sqrt(-2.0 * Math.log(u1)) * Math.cos(2.0 * Math.PI * u2);
@@ -128,8 +169,7 @@ export class MarketSimulator implements FeedAdapter {
   }
 
   /**
-   * Generates synthetic background market participant actions:
-   * Limit order injection, market order arrival, or cancelation.
+   * Generates synthetic background market participant actions around the live stock price.
    */
   private stepSyntheticTrader(): Trade[] {
     const actionRoll = Math.random();
@@ -141,12 +181,11 @@ export class MarketSimulator implements FeedAdapter {
         ? (bestBid.price + bestAsk.price) / 2
         : this.referencePrice;
 
-    // 1. Cancellation of random resting order (15% chance)
+    // 1. Cancellation (15% chance)
     if (actionRoll < 0.15) {
       const isBid = Math.random() > 0.5;
       const levels = isBid ? this.book.getSortedBids() : this.book.getSortedAsks();
       if (levels.length > 2) {
-        // Pick an order slightly away from top of book
         const levelIdx = Math.min(levels.length - 1, Math.floor(1 + Math.random() * 4));
         const level = levels[levelIdx];
         if (level && level.orders.length > 0) {
@@ -203,17 +242,12 @@ export class MarketSimulator implements FeedAdapter {
     return result.trades;
   }
 
-  /**
-   * Main Poisson tick cycle.
-   */
   private scheduleNextTick(): void {
     if (!this.isRunning) return;
 
-    // Poisson inter-arrival time (in ms): Exp(lambda)
     const u = Math.max(1e-5, Math.random());
     const dtSeconds = -Math.log(u) / this.arrivalLambda;
-    // Cap visual update rate between 60ms and 350ms
-    const delayMs = Math.min(350, Math.max(60, Math.round(dtSeconds * 1000)));
+    const delayMs = Math.min(350, Math.max(70, Math.round(dtSeconds * 1000)));
 
     this.timer = setTimeout(() => {
       this.onTick(delayMs / 1000);
@@ -229,7 +263,6 @@ export class MarketSimulator implements FeedAdapter {
     const snapshot = this.getSnapshot();
     const metrics = this.getMetrics();
 
-    // Broadcast updates
     for (const listener of this.listeners) {
       if (listener.onSnapshot) listener.onSnapshot(snapshot);
       if (listener.onMetrics) listener.onMetrics(metrics);
@@ -241,11 +274,25 @@ export class MarketSimulator implements FeedAdapter {
     }
   }
 
+  private getStockQuoteSummary(): StockQuoteSummary | undefined {
+    const yf = getGlobalYahooService();
+    const quote = yf.getQuote();
+    if (!quote) return undefined;
+
+    return {
+      symbol: quote.symbol,
+      price: quote.regularMarketPrice,
+      previousClose: quote.previousClose,
+      change: quote.priceChange,
+      changePercent: quote.priceChangePercent,
+      lastUpdated: quote.lastUpdated,
+    };
+  }
+
   // --- FeedAdapter implementation ---
 
   public subscribe(listener: FeedAdapterListener): () => void {
     this.listeners.add(listener);
-    // Send immediate initial state
     if (listener.onSnapshot) listener.onSnapshot(this.getSnapshot());
     if (listener.onMetrics) listener.onMetrics(this.getMetrics());
 
@@ -262,7 +309,6 @@ export class MarketSimulator implements FeedAdapter {
     );
     this.referencePrice = newReferencePrice;
 
-    // Broadcast immediately on user submission
     const snapshot = this.getSnapshot();
     const metrics = this.getMetrics();
 
@@ -295,7 +341,9 @@ export class MarketSimulator implements FeedAdapter {
   }
 
   public getSnapshot(): BookSnapshot {
-    return this.book.getSnapshot(this.referencePrice, this.sequence, 15);
+    const snapshot = this.book.getSnapshot(this.referencePrice, this.sequence, 15);
+    snapshot.stockQuote = this.getStockQuoteSummary();
+    return snapshot;
   }
 
   public getMetrics(): MicrostructureMetrics {
@@ -335,7 +383,13 @@ export class MarketSimulator implements FeedAdapter {
       bestAsk: bestAsk?.price ?? null,
       bestAskQty: bestAsk?.quantity ?? null,
       timestamp: Date.now(),
+      stockQuote: this.getStockQuoteSummary(),
     };
+  }
+
+  public setSymbol(symbol: string): void {
+    const yf = getGlobalYahooService();
+    yf.setSymbol(symbol);
   }
 
   public start(): void {
@@ -349,6 +403,10 @@ export class MarketSimulator implements FeedAdapter {
     if (this.timer) {
       clearTimeout(this.timer);
       this.timer = null;
+    }
+    if (this.unsubscribeYf) {
+      this.unsubscribeYf();
+      this.unsubscribeYf = null;
     }
   }
 }
